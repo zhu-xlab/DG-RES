@@ -1,278 +1,289 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+
 import argparse
+import collections
+import json
 import os
 import random
+import sys
 import time
+import uuid
+
+import numpy as np
+import PIL
 import torch
-from torch import nn
-from data import data_helper
+import torchvision
+import torch.utils.data
 import torch.nn.functional as F
-from models.resnet_domain import resnet18, resnet50
-from optimizer.optimizer_helper import get_optim_and_scheduler
-from utils.utils import AverageMeter
-from utils.tools import *
-import torch.autograd as autograd
 
-
-def get_args():
-    parser = argparse.ArgumentParser(description="Script to launch jigsaw training",
-                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--target", default=2, type=int, help="Target")
-    parser.add_argument("--device", type=int, default=6, help="GPU num")
-    parser.add_argument("--time", default=0, type=int, help="train time")
-
-    parser.add_argument("--eval", default=0, type=int, help="Eval trained models")
-    parser.add_argument("--eval_model_path", default="/model/path", help="Path of trained models")
-
-    parser.add_argument("--batch_size", "-b", type=int, default=64, help="Batch size")
-    parser.add_argument("--image_size", type=int, default=224, help="Image size")
-
-    parser.add_argument("--data_root", default="/home/Datasets/CV")
-    parser.add_argument("--data", default="PACS")
-    parser.add_argument("--val_perc", type=float, default=0.2, help="validation percentage")
-    parser.add_argument("--result_path", default="./data/save/models/", help="")
-
-    # data aug stuff
-    parser.add_argument("--learning_rate", "-l", type=float, default=.002, help="Learning rate")
-    parser.add_argument("--epochs", "-e", type=int, default=50, help="Number of epochs")
-    parser.add_argument("--min_scale", default=0.8, type=float, help="Minimum scale percent")
-    parser.add_argument("--max_scale", default=1.0, type=float, help="Maximum scale percent")
-    parser.add_argument("--gray_flag", default=1, type=int, help="whether use random gray")
-    parser.add_argument("--random_horiz_flip", default=0.5, type=float, help="Chance of random horizontal flip")
-    parser.add_argument("--jitter", default=0.5, type=float, help="Color jitter amount")
-    parser.add_argument("--tile_random_grayscale", default=0.1, type=float,
-                        help="Chance of randomly greyscaling a tile")
-    parser.add_argument("--network", choices=['resnet18', 'resnet50'], help="Which network to use",
-                        default="resnet18")
-    parser.add_argument("--tf_logger", type=bool, default=True, help="If true will save tensorboard compatible logs")
-    parser.add_argument("--folder_name", default='test', help="Used by the logger to save logs")
-    parser.add_argument("--bias_whole_image", default=0.9, type=float,
-                        help="If set, will bias the training procedure to show more often the whole image")
-    parser.add_argument("--TTA", type=bool, default=False, help="Activate test time data augmentation")
-    parser.add_argument("--classify_only_sane", default=False, type=bool,
-                        help="If true, the network will only try to classify the non scrambled images")
-    parser.add_argument("--train_all", default=True, type=bool, help="If true, all network weights will be trained")
-    parser.add_argument("--suffix", default="", help="Suffix for the logger")
-    parser.add_argument("--nesterov", default=True, type=bool, help="Use nesterov")
-    return parser.parse_args()
-
-
-def get_results_path(args):
-    # Make the directory to store the experimental results
-    base_result_path = args.result_path + "/" + args.data + "/"
-    base_result_path += args.network
-    base_result_path += "_lr" + str(args.learning_rate) + "_B" + str(args.batch_size)
-    base_result_path += "/" + args.target + str(args.time) + "/"
-    if not os.path.exists(base_result_path):
-        os.makedirs(base_result_path)
-    return base_result_path
-
-
-class Trainer:
-    def __init__(self, args, device):
-        self.args = args
-        self.device = device
-        if args.network == 'resnet18':
-            model = resnet18(
-                pretrained=True,
-                device=device,
-                classes=args.n_classes,
-                domains=args.n_domains,
-                network=args.network,
-            )
-        elif args.network == 'resnet50':
-            model = resnet50(
-                pretrained=True,
-                device=device,
-                classes=args.n_classes,
-                domains=args.n_domains,
-                network=args.network,
-            )
-        else:
-            raise NotImplementedError("Not Implemented Network.")
-
-        self.model = model.to(device)
-
-        self.source_loader, self.val_loader = data_helper.get_train_dataloader(args)
-        self.target_loader = data_helper.get_target_dataloader(args)
-        self.test_loaders = {"val": self.val_loader, "test": self.target_loader}
-        print("Dataset size: train %d, val %d, test %d" % (len(self.source_loader.dataset),
-                                                           len(self.val_loader.dataset),
-                                                           len(self.target_loader.dataset)))
-
-        self.optimizer, self.scheduler = \
-            get_optim_and_scheduler(model=model,
-                                    network=args.network,
-                                    epochs=args.epochs,
-                                    lr=args.learning_rate,
-                                    nesterov=args.nesterov)
-        self.n_classes = args.n_classes
-        self.n_domains = args.n_domains
-        self.base_result_path = get_results_path(args)
-
-        self.val_best = 0.0
-        self.criterion = nn.CrossEntropyLoss()
-
-    def _do_epoch(self, epoch=None):
-        losses = AverageMeter()
-        losses_l2 = AverageMeter()
-        class_acc = AverageMeter()
-
-        self.model.train()
-        for it, ((_, image, target, domain), d_idx) in enumerate(self.source_loader):
-            image = image.to(self.device)
-            target = target.to(self.device)
-            domain = domain.to(self.device)
-            batch_size = image.size(0)
-
-            # get predictions
-            # aug_list = ['freq_dropout', 'freq_noise', 'freq_mixup']
-            aug_list = ['spatial_dropout', 'freq_dropout', 'freq_noise', 'freq_mixup']
-            logit, spatial_logit = self.model(image, labels=target, aug_mode=random.choice(aug_list))
-
-            # calculate loss and optimize model
-            loss = self.criterion(logit, target) 
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-
-            # update loss
-            logit = logit.max(dim=1)[1]
-            losses.update(loss.item(), batch_size)
-            class_acc.update((logit==target).sum()/batch_size, 1)
-
-            # print info
-            if it%50==0 or it==len(self.source_loader)-1:
-                print ('epoch: {}/{}, iter: {:3d} '.format(epoch, self.args.epochs, it), 
-                       'loss: {:.4f} '.format(losses.avg), \
-                       'acc: {:.2f} '.format(class_acc.avg*100))
-
-        self.model.eval()
-        with torch.no_grad():
-            val_test_acc = []
-            for phase, loader in self.test_loaders.items():
-                class_acc, _ = self.do_test(phase, loader)
-                val_test_acc.append(class_acc)
-                self.results[phase][self.current_epoch] = class_acc
-                print (phase, 'acc: ', format(class_acc*100, '.2f'))
-            if val_test_acc[0] >= self.val_best:
-                self.val_best = val_test_acc[0]
-                self.save_model(mode="best")
-
-    def do_training(self):
-        self.results = {"val": torch.zeros(self.args.epochs), \
-                        "test": torch.zeros(self.args.epochs)}
-        
-        for self.current_epoch in range(self.args.epochs):
-            start_time = time.time()
-            self._do_epoch(self.current_epoch)
-            self.scheduler.step()
-            end_time = time.time()
-            print("Time for one epoch is " + str(format(end_time-start_time, '.0f')) + "s")
-        
-        self.save_model(mode="last")
-        val_res = self.results["val"]
-        test_res = self.results["test"]
-        idx_best = val_res.argmax()
-        line = "Best val %g, corresponding test %g - best test: %g, best epoch: %g" % (
-        val_res.max(), test_res[idx_best], test_res.max(), idx_best)
-        print(line)
-        with open(self.base_result_path+"test.txt", "a") as f:
-            f.write(line+"\n")
-        return self.model
-
-    def do_eval(self, model_path):
-        checkpoint = torch.load(model_path, map_location='cpu')
-        self.model.load_state_dict(checkpoint, strict=False)
-        self.model.eval()
-        with torch.no_grad():
-            for phase, loader in self.test_loaders.items():
-                class_acc, losses = self.do_test(phase, loader)
-                result = phase + ": CELoss: " + str(format(losses.avg, '.4f')) \
-                               + ", ACC: " + str(format(class_acc.avg, '.4f'))
-                print(result)
-
-    def do_test(self, phase, loader):
-        class_acc = AverageMeter()
-        losses = AverageMeter()
-        for it, ((_, image, target, domain), _) in enumerate(loader):
-            image = image.to(self.device)
-            target = target.to(self.device)
-            logit = self.model(image)[0]           
-            loss = self.criterion(logit, target)
-            logit = logit.max(dim=1)[1]
-            class_acc.update(torch.sum(logit==target).item()/image.size(0))
-            losses.update(loss.item(), image.size(0))
-        return class_acc.avg, losses.avg
-
-    def save_model(self, mode="best"):
-        model_path = self.base_result_path + "models/"
-        if not os.path.exists(model_path):
-            os.makedirs(model_path)
-        model_name = "model_" + mode + ".pth"
-        torch.save({'state_dict': self.model.state_dict()}, 
-                    os.path.join(model_path, model_name))
-
-
-domain_map = {
-    'PACS': ['photo', 'art_painting', 'cartoon', 'sketch'],
-    'OfficeHome': ['Art', 'Clipart', 'Product', 'RealWorld'],
-    'VLCS': ["CALTECH", "LABELME", "PASCAL", "SUN"],
-    'TerraInc': ['location_38', 'location_43', 'location_46', 'location_100']
-}
-
-classes_map = {
-    'PACS': 7,
-    'OfficeHome': 65,
-    'VLCS': 5,
-    'TerraInc': 10
-}
-
-val_perc_map = {
-    'PACS': 0.2,
-    'OfficeHome': 0.2,
-    'VLCS': 0.2,
-    'TerraInc': 0.2
-}
-
-def setup_seed(seed):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.cuda.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.backends.cudnn.deterministic = True
-
-def get_domain(name):
-    if name not in domain_map:
-        raise ValueError('Name of dataset unknown %s' %name)
-    return domain_map[name]
-
-def main():
-    args = get_args()
-
-    domain = get_domain(args.data)
-    args.target = domain.pop(args.target)
-    args.source = domain
-    print("Target domain: {}".format(args.target))
-    args.data_root = os.path.join(args.data_root, args.data)
-    args.n_classes = classes_map[args.data]
-    args.n_domains = len(domain)
-    args.val_perc = val_perc_map[args.data]
-    setup_seed(args.time)
-
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.device)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    trainer = Trainer(args, device)
-    if args.eval:
-        model_path = args.eval_model_path
-        trainer.do_eval(model_path=model_path)
-        return
-    trainer.do_training()
-
+from domainbed import datasets
+from domainbed import hparams_registry
+from domainbed import algorithms
+from domainbed.lib import misc
+from domainbed.lib.fast_data_loader import InfiniteDataLoader, FastDataLoader
 
 if __name__ == "__main__":
-    torch.backends.cudnn.benchmark = True
-    main()
+    parser = argparse.ArgumentParser(description='Domain generalization')
+    parser.add_argument('--data_dir', type=str)
+    parser.add_argument('--dataset', type=str, default="RotatedMNIST")
+    parser.add_argument('--algorithm', type=str, default="ERM")
+    parser.add_argument('--task', type=str, default="domain_generalization",
+        choices=["domain_generalization", "domain_adaptation"])
+    parser.add_argument('--hparams', type=str,
+        help='JSON-serialized hparams dict')
+    parser.add_argument('--hparams_seed', type=int, default=0,
+        help='Seed for random hparams (0 means "default hparams")')
+    parser.add_argument('--trial_seed', type=int, default=0,
+        help='Trial number (used for seeding split_dataset and '
+        'random_hparams).')
+    parser.add_argument('--seed', type=int, default=0,
+        help='Seed for everything else')
+    parser.add_argument('--steps', type=int, default=None,
+        help='Number of steps. Default is dataset-dependent.')
+    parser.add_argument('--checkpoint_freq', type=int, default=None,
+        help='Checkpoint every N steps. Default is dataset-dependent.')
+    parser.add_argument('--test_envs', type=int, nargs='+', default=[0])
+    parser.add_argument('--output_dir', type=str, default="train_output")
+    parser.add_argument('--holdout_fraction', type=float, default=0.2)
+    parser.add_argument('--skip_model_save', action='store_true')
+    parser.add_argument('--save_model_every_checkpoint', action='store_true')
+    args = parser.parse_args()
 
+    # If we ever want to implement checkpointing, just persist these values
+    # every once in a while, and then load them from disk here.
+    start_step = 0
+    algorithm_dict = None
 
+    os.makedirs(args.output_dir, exist_ok=True)
+    sys.stdout = misc.Tee(os.path.join(args.output_dir, 'out.txt'))
+    sys.stderr = misc.Tee(os.path.join(args.output_dir, 'err.txt'))
+
+    print("Environment:")
+    print("\tPython: {}".format(sys.version.split(" ")[0]))
+    print("\tPyTorch: {}".format(torch.__version__))
+    print("\tTorchvision: {}".format(torchvision.__version__))
+    print("\tCUDA: {}".format(torch.version.cuda))
+    print("\tCUDNN: {}".format(torch.backends.cudnn.version()))
+    print("\tNumPy: {}".format(np.__version__))
+    print("\tPIL: {}".format(PIL.__version__))
+
+    print('Args:')
+    for k, v in sorted(vars(args).items()):
+        print('\t{}: {}'.format(k, v))
+
+    if args.hparams_seed == 0:
+        hparams = hparams_registry.default_hparams(args.algorithm, args.dataset)
+    else:
+        hparams = hparams_registry.random_hparams(args.algorithm, args.dataset,
+            misc.seed_hash(args.hparams_seed, args.trial_seed))
+    if args.hparams:
+        hparams.update(json.loads(args.hparams))
+
+    print('HParams:')
+    for k, v in sorted(hparams.items()):
+        print('\t{}: {}'.format(k, v))
+
+    # random.seed(args.seed)
+    # np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    if torch.cuda.is_available():
+        device = "cuda"
+    else:
+        device = "cpu"
+
+    if args.dataset in vars(datasets):
+        dataset = vars(datasets)[args.dataset](args.data_dir,
+            args.test_envs, hparams)
+    else:
+        raise NotImplementedError
+
+    # Split each env into an 'in-split' and an 'out-split'. We'll train on
+    # each in-split except the test envs, and evaluate on all splits.
+
+    in_splits = []
+    out_splits = []
+    for env_i, env in enumerate(dataset):
+        out, in_ = misc.split_dataset(env,
+            int(len(env)*args.holdout_fraction),
+            misc.seed_hash(args.trial_seed, env_i))
+
+        if hparams['class_balanced']:
+            in_weights = misc.make_weights_for_balanced_classes(in_)
+            out_weights = misc.make_weights_for_balanced_classes(out)
+        else:
+            in_weights, out_weights = None, None
+        in_splits.append((in_, in_weights))
+        out_splits.append((out, out_weights))
+
+    # train_loaders = [InfiniteDataLoader(
+    #     dataset=env,
+    #     weights=env_weights,
+    #     batch_size=hparams['batch_size'],
+    #     num_workers=dataset.N_WORKERS)
+    #     for i, (env, env_weights) in enumerate(in_splits)
+    #     if i not in args.test_envs]
+
+    # build train dataloader
+    train_envs = torch.utils.data.ConcatDataset(
+        [env for i, (env, env_weights) in enumerate(in_splits) \
+            if i not in args.test_envs])
+    indices = list(range(len(train_envs)))
+    random.shuffle(indices)
+    train_envs = torch.utils.data.Subset(train_envs, indices)
+    train_loaders = torch.utils.data.DataLoader(
+        train_envs, 
+        batch_size=hparams['batch_size'], 
+        num_workers=dataset.N_WORKERS,
+        drop_last=False,
+        shuffle=True)
+
+    # build eval dataloader
+    eval_loaders = [FastDataLoader(
+        dataset=env,
+        batch_size=hparams['batch_size'],
+        num_workers=dataset.N_WORKERS)
+        for env, _ in (in_splits + out_splits)]
+    eval_weights = [None for _, weights in (in_splits + out_splits)]
+    eval_loader_names = ['env{}_in'.format(i)
+        for i in range(len(in_splits))]
+    eval_loader_names += ['env{}_out'.format(i)
+        for i in range(len(out_splits))]
+
+    # build algorithm
+    algorithm_class = algorithms.get_algorithm_class(args.algorithm)
+    algorithm = algorithm_class(dataset.input_shape, dataset.num_classes,
+        len(dataset) - len(args.test_envs), hparams)
+    if algorithm_dict is not None:
+        algorithm.load_state_dict(algorithm_dict)
+    algorithm.to(device)
+
+    # get training status
+    minibatches_iterator = iter(train_loaders)
+    checkpoint_vals = collections.defaultdict(lambda: [])
+    steps_per_epoch = len(train_loaders)
+    n_steps = args.steps or dataset.N_STEPS
+    checkpoint_freq = args.checkpoint_freq or dataset.CHECKPOINT_FREQ
+
+    def save_checkpoint(filename):
+        if args.skip_model_save:
+            return
+        save_dict = {
+            "args": vars(args),
+            "model_input_shape": dataset.input_shape,
+            "model_num_classes": dataset.num_classes,
+            "model_num_domains": len(dataset) - len(args.test_envs),
+            "model_hparams": hparams,
+            "model_dict": algorithm.state_dict()
+        }
+        torch.save(save_dict, os.path.join(args.output_dir, filename))
+
+    val_acc = 0
+    last_results_keys = None
+    acc_list = {'val_acc': [], 'test_acc': [], 'similarity': []}
+    for step in range(start_step, n_steps):
+        step_start_time = time.time()
+        # train data_iter
+        try:    
+            x, y = next(minibatches_iterator)
+        except StopIteration:
+            train_envs = torch.utils.data.ConcatDataset(
+                [env for i, (env, env_weights) in enumerate(in_splits) \
+                    if i not in args.test_envs])
+            indices = list(range(len(train_envs)))
+            random.shuffle(indices)
+            train_envs = torch.utils.data.Subset(train_envs, indices)
+            train_loaders = torch.utils.data.DataLoader(
+                train_envs, 
+                batch_size=hparams['batch_size'], 
+                num_workers=dataset.N_WORKERS,
+                drop_last=False,
+                shuffle=True
+            )
+            minibatches_iterator = iter(train_loaders)
+            x, y = next(minibatches_iterator)
+
+        minibatches = [(x.to(device), y.to(device))]
+        step_vals = algorithm.update(minibatches)
+        checkpoint_vals['step_time'].append(time.time() - step_start_time)
+
+        for key, val in step_vals.items():
+            checkpoint_vals[key].append(val)
+
+        if (step % checkpoint_freq == 0) or (step == n_steps - 1):
+            results = {
+                'step': step,
+                'epoch': step / steps_per_epoch,
+            }
+
+            for key, val in checkpoint_vals.items():
+                results[key] = np.mean(val)
+
+            # algorithm.update_ema_hist()
+
+            val_acc_total, val_env_total, test_acc = 0, 0, 0
+            feats_val = torch.zeros((0, 2048)).cuda()
+            feats_test = torch.zeros((0, 2048)).cuda()
+            evals = zip(eval_loader_names, eval_loaders, eval_weights)
+            for name, loader, weights in evals:
+                acc, correct_num, total_num = misc.accuracy(algorithm, loader, weights, device)
+                results[name+'_acc'] = acc
+                if str(args.test_envs[0]) in name:
+                    if '_in' in name:
+                        test_acc = acc
+                else:
+                    if '_out' in name:
+                        val_acc_total += acc
+                        val_env_total += 1.0
+
+            val_acc = val_acc_total / val_env_total
+            acc_list['val_acc'].append(val_acc)
+            acc_list['test_acc'].append(test_acc)
+            results['mem_gb'] = torch.cuda.max_memory_allocated() / (1024.*1024.*1024.)
+
+            results_keys = sorted(results.keys())
+            if results_keys != last_results_keys:
+                misc.print_row(results_keys, colwidth=12)
+                last_results_keys = results_keys
+            misc.print_row([results[key] for key in results_keys],
+                colwidth=12)
+
+            results.update({
+                'hparams': hparams,
+                'args': vars(args)
+            })
+
+            epochs_path = os.path.join(args.output_dir, 'results.jsonl')
+            with open(epochs_path, 'a') as f:
+                f.write(json.dumps(results, sort_keys=True) + "\n")
+
+            algorithm_dict = algorithm.state_dict()
+            start_step = step + 1
+            checkpoint_vals = collections.defaultdict(lambda: [])
+
+            if args.save_model_every_checkpoint:
+                save_checkpoint(f'model_step{step}.pkl')
+
+    max_val_acc = 0
+    max_test_acc = 0
+    for idx, val_acc in enumerate(acc_list['val_acc']):
+        if val_acc > max_val_acc:
+            max_val_acc = val_acc
+            max_test_acc = acc_list['test_acc'][idx]
+    print ('max_val_acc: ', max_val_acc, ' max_test_acc: ', max_test_acc)
+
+    with open('{}_env_{}_{}_val_acc.txt'.format(args.dataset, \
+                str(args.test_envs[0]), args.algorithm), 'w') as file:
+        for number in acc_list['val_acc']:
+            file.write(f"{number}\n")
+    with open('{}_env_{}_{}_test_acc.txt'.format(args.dataset, \
+                str(args.test_envs[0]), args.algorithm), 'w') as file:
+        for number in acc_list['test_acc']:
+            file.write(f"{number}\n")
+
+    save_checkpoint('model_{}_{}_{}.pkl'.format(args.dataset, str(args.test_envs[0]), args.algorithm))
+
+    with open(os.path.join(args.output_dir, 'done'), 'w') as f:
+        f.write('done')
